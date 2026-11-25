@@ -521,6 +521,13 @@ static inline void ggml_thread_cpu_relax(void) {
 static inline void ggml_thread_cpu_relax(void) {
     _mm_pause();
 }
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+// MSVC defines _M_X64 / _M_IX86, not __x86_64__, so without this branch the relax
+// above compiled to nothing: barrier waiters spun without `pause`.
+// YieldProcessor() emits `pause` on x86 and x64.
+static inline void ggml_thread_cpu_relax(void) {
+    YieldProcessor();
+}
 #elif defined(__riscv)
 static inline void ggml_thread_cpu_relax(void) {
     #ifdef __riscv_zihintpause
@@ -533,6 +540,22 @@ static inline void ggml_thread_cpu_relax(void) {
 #else
 static inline void ggml_thread_cpu_relax(void) {;}
 #endif
+
+// Give the core to another ready thread. A pause spin keeps the core, so when there
+// are more compute threads than free logical CPUs, barrier waiters can starve a
+// worker that has not arrived yet. After a bounded spin, the waiters yield so that
+// worker can run.
+static inline void ggml_thread_yield(void) {
+#if defined(_WIN32)
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+// Relax iterations between yields while a barrier waits. A yield with no other ready
+// thread returns at once, so a waiter that has its own core loses little.
+#define GGML_BARRIER_SPIN_BEFORE_YIELD 4096
 
 //
 // NUMA support
@@ -593,8 +616,15 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     }
 
     // wait for other threads
+    int spin = 0;
     while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
-        ggml_thread_cpu_relax();
+        if (++spin < GGML_BARRIER_SPIN_BEFORE_YIELD) {
+            ggml_thread_cpu_relax();
+        } else {
+            // a worker has not arrived after a bounded spin: let it run (see ggml_thread_yield)
+            ggml_thread_yield();
+            spin = 0;
+        }
     }
 
     // exit barrier (full seq-cst fence)
